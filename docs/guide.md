@@ -213,6 +213,7 @@ The macro pulls in `OUT_DIR/<dotted.pkg>.mod.rs`, which in turn includes the per
 | `.json_feature_name(name)` etc. | `"json"`, `"views"`, `"text"`, `"reflect"` | Rename the crate feature a gated impl kind is conditioned on (one setter per kind: `json_feature_name`, `views_feature_name`, `text_feature_name`, `reflect_feature_name`); inert without `gate_impls_on_crate_features`. The renamed feature must be declared in the consuming crate's `[features]` table — an undeclared name leaves the `#[cfg]` permanently false and the impls silently absent |
 | `.strict_utf8_mapping(bool)` | `false` | Map `utf8_validation = NONE` string fields to `Vec<u8>` / `&[u8]` instead of `String` (see [Skipping UTF-8 validation](#skipping-utf-8-validation)) |
 | `.extern_path(proto, rust)` | — | Map a proto package or a single type to an external Rust path (see below) |
+| `.file_extern_path(file, rust)` | — | Map every type in one `.proto` file to the Rust module of its package in another crate (see below) |
 | `.exclude_package(pkg)` | — | Drop a proto package (and its sub-packages) from code generation. Useful when directory globbing pulls in option-only packages (e.g. `buf.validate`) that you don't want Rust types for. A leading dot is accepted and stripped. Pair with `.extern_path` if kept files reference types from the excluded package; the generator emits a `cargo:warning` for each such cross-package reference. |
 | `.type_name_prefix(prefix)` | `""` | Prepend a PascalCase prefix (`[A-Z][A-Za-z0-9]*`; anything else is rejected at generation time) to every generated message/enum type name (`message User` → `struct RpcUser`); modules, oneof enums, extern-mapped types, and the wire format are unaffected. A crate referencing these types via `extern_path` must spell out the prefixed name (`::crate_a::RpcUser`) |
 | `.use_bytes_type()` | — | Use `bytes::Bytes` for all bytes fields, including `map<K, bytes>` values |
@@ -311,6 +312,23 @@ buffa_build::Config::new()
 ```
 
 When several entries could match a reference, the most specific one wins: an exact type FQN beats a covering package prefix, and a longer package prefix beats a shorter one. Nested types inherit an enclosing message's per-type override — `my.common.SharedMessage.Inner` resolves to `::shared_types::shared_message::Inner`, i.e. the override's parent module plus buffa's usual `snake_case(MessageName)` nested-types module. That layout matches another buffa-generated crate; if the target crate lays out nested types differently, add explicit per-type entries for the nested types as well.
+
+**Per-file mappings:** a package mapping can't express a package whose files are compiled into different crates, or a file with no `package` (its prefix would be the catch-all `.`). Map such files one at a time with `file_extern_path`, naming the file as protoc reports it and the module holding its package in the owning crate:
+
+```rust,ignore
+buffa_build::Config::new()
+    // `my.common` is split across two crates.
+    .file_extern_path("my/common/money.proto", "::money_protos::my::common")
+    .file_extern_path("my/common/time.proto", "::time_protos::my::common")
+    // A package-less file's types sit at its crate's root.
+    .file_extern_path("legacy.proto", "::legacy_protos")
+    .files(&["proto/my_service.proto"])
+    .includes(&["proto/"])
+    .compile()
+    .unwrap();
+```
+
+The file key must be the import path relative to the include root, exactly as protoc reports it (`my/common/money.proto`, not `proto/my/common/money.proto`); a key that matches no imported file raises a warning. The Rust path must be absolute. A file mapping outranks a package mapping and yields to a per-type one. It is ignored for a file that is being generated, so with `include_imports` also keep the mapped file out of the generate set (for example with `exclude_package`, if its whole package lives elsewhere). Build systems that compile one crate per proto target can emit one entry per dependency file.
 
 **Nested-module deconfliction across crates:** if the owning crate renamed a message's nested-types module to avoid colliding with a sibling sub-package (e.g. `Money`'s nested types live in `money_` because sub-package `pb.lyft.money` also exists), the consumer must compute the same name. That requires the consumer's descriptor set to *contain* the colliding sub-package file — importing any type from it (even unused) is sufficient. If the consumer never imports from the sub-package, the generated reference uses the un-deconflicted module name and fails to compile against the owning crate.
 
@@ -632,6 +650,7 @@ Passed via `opt:` (works for `remote:` and `local:`):
 | `reflect_mode=off\|bridge\|vtable` | Finer-grained reflection selector; `reflection=true` is shorthand for `vtable` |
 | `shared_descriptor_pool=true` | Deduplicate the embedded descriptor set: per-package reflect modules delegate to one shared `__buffa_fds` root module. Pass a matching `shared_descriptor_pool=true` to `protoc-gen-buffa-packaging` so the root module is emitted. See [Runtime reflection](#runtime-reflection) |
 | `extern_path=.pkg=::rust` | Map a proto package — or a single type, e.g. `extern_path=.pkg.Type=::rust::Type` — to an external Rust path |
+| `file_extern_path=path/file.proto=::rust::pkg` | Map every type in one `.proto` file to the Rust module of its package in another crate. Repeatable |
 | `exclude_package=.pkg` | Drop a proto package and its subpackages from generation (repeatable; leading dot optional). For option-only imports that `include_imports` pulls in but that are never used as field types, e.g. `buf.validate`, `gnostic`. **Pass the same `exclude_package` to `protoc-gen-buffa-packaging`** (see the note below the table) so the generated `mod.rs` omits the same packages. |
 | `file_per_package=true` | Emit one `<dotted.package>.rs` per package instead of per-proto-file content + a `<dotted.pkg>.mod.rs` stitcher. Use this with the remote plugin when you don't want to install `protoc-gen-buffa-packaging` — see [Remote plugin only](#remote-plugin-only-no-local-install). Under `strategy: directory`, requires the input module to be `PACKAGE_DIRECTORY_MATCH`-clean. |
 | `idiomatic_imports=true` | **Experimental.** Emit `use`-backed short type names at the package root. Requires `file_per_package=true`. Only type declarations are shortened; the generated file must keep its `#[allow]` wrapper. |

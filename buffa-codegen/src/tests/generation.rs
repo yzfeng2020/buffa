@@ -2980,3 +2980,217 @@ fn test_exclude_packages_filter_runs_before_context_build() {
         "no local path to the excluded package may be emitted: {content}"
     );
 }
+
+// ---- user file-level extern paths (CodeGenConfig::file_extern_paths) -------
+
+fn message_field(name: &str, number: i32, type_name: &str) -> FieldDescriptorProto {
+    FieldDescriptorProto {
+        type_name: Some(type_name.to_string()),
+        ..make_field(name, number, Label::LABEL_OPTIONAL, Type::TYPE_MESSAGE)
+    }
+}
+
+fn file_with_message(name: &str, package: Option<&str>, message: &str) -> FileDescriptorProto {
+    let mut file = proto3_file(name);
+    file.package = package.map(str::to_string);
+    file.message_type.push(DescriptorProto {
+        name: Some(message.to_string()),
+        ..Default::default()
+    });
+    file
+}
+
+/// `app/user.proto` (package `app`) with one message field per `type_names`.
+fn user_file(deps: &[&str], type_names: &[&str]) -> FileDescriptorProto {
+    let mut file = proto3_file("app/user.proto");
+    file.package = Some("app".to_string());
+    file.dependency = deps.iter().map(|d| d.to_string()).collect();
+    file.message_type.push(DescriptorProto {
+        name: Some("User".to_string()),
+        field: type_names
+            .iter()
+            .zip(1..)
+            .map(|(ty, n)| message_field(&format!("f{n}"), n, ty))
+            .collect(),
+        ..Default::default()
+    });
+    file
+}
+
+fn generate_user(files: &[FileDescriptorProto], config: &CodeGenConfig) -> String {
+    let files = generate(files, &["app/user.proto".to_string()], config).expect("should generate");
+    joined(&files)
+}
+
+#[test]
+fn test_file_extern_paths_route_a_split_package_to_each_owning_crate() {
+    // One package, two files, two crates: a `.shared` package mapping can
+    // only name one of them.
+    let a = file_with_message("shared/a.proto", Some("shared"), "A");
+    let b = file_with_message("shared/b.proto", Some("shared"), "B");
+    let user = user_file(
+        &["shared/a.proto", "shared/b.proto"],
+        &[".shared.A", ".shared.B"],
+    );
+    let config = CodeGenConfig {
+        file_extern_paths: vec![
+            ("shared/a.proto".into(), "::crate_a::shared".into()),
+            ("shared/b.proto".into(), "::crate_b::shared".into()),
+        ],
+        ..Default::default()
+    };
+    let content = generate_user(&[a, b, user], &config);
+    assert!(content.contains("::crate_a::shared::A"), "{content}");
+    assert!(content.contains("::crate_b::shared::B"), "{content}");
+    assert!(
+        content.contains("::crate_a::shared::__buffa::view::AView"),
+        "{content}"
+    );
+}
+
+#[test]
+fn test_file_extern_paths_route_a_package_less_file() {
+    // A package-less file has no package prefix to map short of the `.`
+    // catch-all, which would capture every type.
+    let legacy = file_with_message("legacy.proto", None, "Legacy");
+    let user = user_file(&["legacy.proto"], &[".Legacy"]);
+    let config = CodeGenConfig {
+        file_extern_paths: vec![("legacy.proto".into(), "::legacy_protos".into())],
+        ..Default::default()
+    };
+    let content = generate_user(&[legacy, user], &config);
+    assert!(content.contains("::legacy_protos::Legacy"), "{content}");
+    assert!(
+        content.contains("::legacy_protos::__buffa::view::LegacyView"),
+        "{content}"
+    );
+}
+
+#[test]
+fn test_file_extern_paths_keep_the_generated_half_of_a_split_package_local() {
+    // The generated file shares its package with an externed dependency
+    // file: only the dependency's types leave the crate.
+    let dep = file_with_message("shared/dep.proto", Some("shared"), "Dep");
+    let mut leaf = file_with_message("shared/leaf.proto", Some("shared"), "Leaf");
+    leaf.dependency = vec!["shared/dep.proto".to_string()];
+    leaf.message_type[0].field = vec![message_field("dep", 1, ".shared.Dep")];
+    let config = CodeGenConfig {
+        file_extern_paths: vec![("shared/dep.proto".into(), "::dep_crate::shared".into())],
+        ..Default::default()
+    };
+    let files = generate(&[dep, leaf], &["shared/leaf.proto".to_string()], &config)
+        .expect("should generate");
+    let content = joined(&files);
+    assert!(content.contains("::dep_crate::shared::Dep"), "{content}");
+    assert!(content.contains("pub struct Leaf"), "{content}");
+    assert!(!content.contains("pub struct Dep"), "{content}");
+}
+
+#[test]
+fn test_file_extern_paths_cover_nested_types_and_enums() {
+    let mut dep = file_with_message("shared/dep.proto", Some("shared"), "Outer");
+    dep.message_type[0].nested_type.push(DescriptorProto {
+        name: Some("Inner".to_string()),
+        ..Default::default()
+    });
+    dep.enum_type.push(EnumDescriptorProto {
+        name: Some("Kind".to_string()),
+        value: vec![enum_value("KIND_UNSPECIFIED", 0)],
+        ..Default::default()
+    });
+    let mut user = user_file(&["shared/dep.proto"], &[".shared.Outer.Inner"]);
+    user.message_type[0].field.push(FieldDescriptorProto {
+        type_name: Some(".shared.Kind".to_string()),
+        ..make_field("kind", 2, Label::LABEL_OPTIONAL, Type::TYPE_ENUM)
+    });
+    let config = CodeGenConfig {
+        file_extern_paths: vec![("shared/dep.proto".into(), "::dep_crate::shared".into())],
+        ..Default::default()
+    };
+    let content = generate_user(&[dep, user], &config);
+    assert!(
+        content.contains("::dep_crate::shared::outer::Inner"),
+        "{content}"
+    );
+    assert!(content.contains("::dep_crate::shared::Kind"), "{content}");
+}
+
+#[test]
+fn test_file_extern_paths_outrank_package_and_yield_to_per_type_entries() {
+    let a = file_with_message("shared/a.proto", Some("shared"), "A");
+    let mut b = file_with_message("shared/b.proto", Some("shared"), "B");
+    b.message_type.push(DescriptorProto {
+        name: Some("Pinned".to_string()),
+        ..Default::default()
+    });
+    let user = user_file(
+        &["shared/a.proto", "shared/b.proto"],
+        &[".shared.A", ".shared.B", ".shared.Pinned"],
+    );
+    let config = CodeGenConfig {
+        extern_paths: vec![
+            (".shared".into(), "::package_crate".into()),
+            (".shared.Pinned".into(), "::pinned::Pinned".into()),
+        ],
+        file_extern_paths: vec![("shared/b.proto".into(), "::crate_b::shared".into())],
+        ..Default::default()
+    };
+    let content = generate_user(&[a, b, user], &config);
+    assert!(content.contains("::package_crate::A"), "{content}");
+    assert!(content.contains("::crate_b::shared::B"), "{content}");
+    assert!(content.contains("::pinned::Pinned"), "{content}");
+}
+
+#[test]
+fn test_effective_file_extern_paths_merges_user_entries_first() {
+    let config = CodeGenConfig {
+        // The package mapping suppresses only the auto-injected entries.
+        extern_paths: vec![(".my".into(), "::my_crate".into())],
+        file_extern_paths: vec![
+            ("my/a.proto".into(), "::crate_a::my".into()),
+            ("my/generated.proto".into(), "::never".into()),
+            (
+                "google/protobuf/descriptor.proto".into(),
+                "::my_descriptor".into(),
+            ),
+        ],
+        ..Default::default()
+    };
+    let file_paths = effective_file_extern_paths(&["my/generated.proto".to_string()], &config);
+    assert_eq!(
+        file_paths,
+        vec![
+            ("my/a.proto".to_string(), "::crate_a::my".to_string()),
+            (
+                "google/protobuf/descriptor.proto".to_string(),
+                "::my_descriptor".to_string(),
+            ),
+            (
+                "google/protobuf/compiler/plugin.proto".to_string(),
+                "::buffa_descriptor::generated::compiler".to_string(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn test_file_extern_path_matching_no_file_warns() {
+    let fds = vec![make_file_with_package("example/foo.proto", "example")];
+    let config = CodeGenConfig {
+        file_extern_paths: vec![
+            // Include-root prefix: protoc names the file `example/foo.proto`.
+            ("proto/example/foo.proto".into(), "::other::example".into()),
+            ("example/foo.proto".into(), "::other::example".into()),
+        ],
+        ..Default::default()
+    };
+    let (_, warnings) = generate_with_diagnostics(&fds, &[], &config).expect("generation failed");
+    let unmatched: Vec<_> = warnings
+        .iter()
+        .filter_map(|w| match w {
+            CodeGenWarning::FileExternPathMatchedNothing { file } => Some(file.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unmatched, ["proto/example/foo.proto"], "{warnings:?}");
+}

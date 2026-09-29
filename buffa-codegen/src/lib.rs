@@ -1198,7 +1198,9 @@ pub struct CodeGenConfig {
     /// path instead of being generated, allowing shared proto packages to be
     /// compiled once in a dedicated crate and referenced from others. An
     /// exact type-FQN entry wins over a covering package prefix; otherwise
-    /// the longest matching prefix wins.
+    /// the longest matching prefix wins. To route a single `.proto` file (a
+    /// package split across crates, or a file with no `package`), use
+    /// [`file_extern_paths`](Self::file_extern_paths).
     ///
     /// Well-known types (`google.protobuf.*`) are automatically mapped to
     /// `::buffa_types::google::protobuf::*` without needing an explicit
@@ -1213,6 +1215,33 @@ pub struct CodeGenConfig {
     /// values in bytes-keyed maps; ordinary message containers use serde
     /// directly.
     pub extern_paths: Vec<(String, String)>,
+    /// File-level external type path mappings.
+    ///
+    /// Each entry maps a `.proto` file to the absolute Rust path (`::crate::…`)
+    /// where its types are reachable. The key must equal
+    /// `FileDescriptorProto.name` exactly: the import path relative to the
+    /// include root, as protoc reports it (e.g. `"my/common/money.proto"`, not
+    /// `"proto/my/common/money.proto"` or `"./my/common/money.proto"`). For a
+    /// buffa-generated crate the value is the module holding the file's
+    /// package (e.g. `"::money_protos::my::common"`), or the crate root for a
+    /// file with no `package`. Every type the file declares, nested types
+    /// included, resolves under that module. An entry that names no file in
+    /// the descriptor set raises
+    /// [`CodeGenWarning::FileExternPathMatchedNothing`]. The first entry for a
+    /// file wins.
+    ///
+    /// Use this when a package-keyed [`extern_paths`](Self::extern_paths) entry
+    /// can't express where types live: a proto package split across files
+    /// compiled into different crates, or a file with no `package` (whose
+    /// package prefix would be the catch-all `.`). Build systems that compile
+    /// one crate per proto target can map each dependency file to its crate.
+    ///
+    /// A file-level entry outranks a package-prefix `extern_paths` match and
+    /// yields to an exact per-type entry. Entries for files in
+    /// `files_to_generate` are ignored, since those types are generated
+    /// locally. A user entry replaces the built-in `descriptor.proto` /
+    /// `plugin.proto` routing for the same file.
+    pub file_extern_paths: Vec<(String, String)>,
     /// Ordered (proto-path-prefix, [`BytesRepr`]) rules selecting the Rust type
     /// for `bytes` fields. Later rules win, so a broad rule (e.g. `"."` →
     /// `Bytes`) can be refined by a more specific one. Fields matching no rule
@@ -1572,7 +1601,8 @@ pub struct CodeGenConfig {
     /// oneof/pointer-repr resolution and comment collection on every
     /// `generate()` call — the win for a one-crate-per-package workspace that
     /// generates each package from one whole-corpus `FileDescriptorSet` with
-    /// only `extern_paths` varying per call. The context must have been built
+    /// only the extern mappings (`extern_paths`, `file_extern_paths`) varying
+    /// per call. The context must have been built
     /// from the same `files` and the same
     /// `unboxed_oneof_fields`/`pointer_fields` as the call using it;
     /// `generate` checks and returns
@@ -1799,6 +1829,7 @@ impl Default for CodeGenConfig {
             generate_json: false,
             generate_arbitrary: false,
             extern_paths: Vec::new(),
+            file_extern_paths: Vec::new(),
             bytes_fields: Vec::new(),
             string_fields: Vec::new(),
             map_fields: Vec::new(),
@@ -1969,11 +2000,10 @@ pub(crate) fn effective_extern_paths(
 ///   `buffa-descriptor` (or any local copy of `descriptor.proto`), its types
 ///   must resolve to the local module, not externally.
 ///
-/// Currently internal-only — there is no `CodeGenConfig` field for
-/// user-provided *file-level* mappings. The user-facing `extern_path` API is
-/// keyed by proto package *or* type FQN (per-type overrides, issue #111);
-/// per-file overrides may be added later as a public feature if a concrete
-/// need arises.
+/// User-provided [`CodeGenConfig::file_extern_paths`] come first, minus any
+/// file in `files_to_generate`, and replace an auto-injected entry for the
+/// same file. A package-level `extern_path` suppresses only the auto-injected
+/// entries: a user file-level mapping is the more specific of the two.
 pub(crate) fn effective_file_extern_paths(
     files_to_generate: &[String],
     config: &CodeGenConfig,
@@ -1995,9 +2025,23 @@ pub(crate) fn effective_file_extern_paths(
         ),
     ];
 
-    DESCRIPTOR_FILES
+    let mut paths: Vec<(String, String)> = config
+        .file_extern_paths
+        .iter()
+        .filter(|(proto_file, _)| !files_to_generate.contains(proto_file))
+        .cloned()
+        .collect();
+
+    let auto = DESCRIPTOR_FILES
         .into_iter()
         .filter(|(proto_file, package, _)| {
+            if config
+                .file_extern_paths
+                .iter()
+                .any(|(user_file, _)| user_file == proto_file)
+            {
+                return false;
+            }
             // Yield to a user package-level extern_path that already covers
             // this file's package: anyone who wrote
             // `extern_path(".google.protobuf", "::my_crate")` (or a
@@ -2010,8 +2054,9 @@ pub(crate) fn effective_file_extern_paths(
             // Don't externalize a file we're generating locally.
             !files_to_generate.iter().any(|f| f == proto_file)
         })
-        .map(|(proto_file, _, rust_module)| (proto_file.to_string(), rust_module.to_string()))
-        .collect()
+        .map(|(proto_file, _, rust_module)| (proto_file.to_string(), rust_module.to_string()));
+    paths.extend(auto);
+    paths
 }
 
 /// One CamelCase collision: a target identifier and the proto value names that
@@ -2145,6 +2190,15 @@ pub enum CodeGenWarning {
         /// (leading dot already stripped).
         package: String,
     },
+    /// A [`file_extern_paths`](CodeGenConfig::file_extern_paths) entry names no
+    /// file in the descriptor set, so it maps nothing. Usually the key is not
+    /// the include-relative import path protoc reports (a leading `./`, an
+    /// include-root directory prefix, or a typo), or the file is not imported.
+    #[non_exhaustive]
+    FileExternPathMatchedNothing {
+        /// The file key exactly as configured.
+        file: String,
+    },
     /// A [`feature_overrides`](CodeGenConfig::feature_overrides) rule matched
     /// nothing the override targets in the compiled descriptor set, so it
     /// changed nothing. Usually a typo, a missing nested-message segment, or
@@ -2277,10 +2331,20 @@ impl core::fmt::Display for CodeGenWarning {
                      (buffa-build: `.extern_path(\"{type_fqn}\", \"::your_crate::Type\")` \
                      or `.extern_path(\".{ref_package}\", \"::your_crate\")`; \
                      plugin: `extern_path={type_fqn}=::your_crate::Type` or \
-                     `extern_path=.{ref_package}=::your_crate`), or include the \
+                     `extern_path=.{ref_package}=::your_crate`; for a package split \
+                     across crates, map the defining file with `.file_extern_path(…)` / \
+                     `file_extern_path=`), or include the \
                      defining .proto file in the generate set \
                      (buffa-build: `.files(&[…])` or drop `.exclude_package(…)`; \
                      plugin: drop `exclude_package=`)"
+                )
+            }
+            Self::FileExternPathMatchedNothing { file } => {
+                write!(
+                    f,
+                    "file_extern_path entry \"{file}\" matched no .proto file in the \
+                     descriptor set — the key must be the import path relative to the \
+                     include root, exactly as protoc reports it (e.g. \"my/pkg/file.proto\")"
                 )
             }
             Self::ExcludePackageMatchedNothing { package } => {
@@ -3028,6 +3092,15 @@ pub fn generate_with_diagnostics(
         }
     }
 
+    for (file, _) in &config.file_extern_paths {
+        if !file_descriptors
+            .iter()
+            .any(|fd| fd.name.as_deref() == Some(file.as_str()))
+        {
+            ctx.warn(CodeGenWarning::FileExternPathMatchedNothing { file: file.clone() });
+        }
+    }
+
     // Group requested files by package. BTreeMap → deterministic output order.
     let mut by_package: std::collections::BTreeMap<String, Vec<&FileDescriptorProto>> =
         std::collections::BTreeMap::new();
@@ -3247,7 +3320,7 @@ pub enum IncludeMode<'a> {
 /// The corpus-wide state `CodeGenContext` derives on every `generate()`
 /// call — which oneof variants are unboxed, which message fields are stored
 /// inline, and the raw comment text per fully-qualified name — none of which
-/// depends on the extern paths that legitimately vary per call in a
+/// depends on the extern mappings that legitimately vary per call in a
 /// one-crate-per-package workspace. Build one with [`SharedCorpusContext::new`]
 /// from the whole corpus and set [`CodeGenConfig::shared_corpus_context`] on
 /// every per-package config to skip that work on each call.

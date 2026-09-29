@@ -180,6 +180,9 @@ struct PluginConfig {
 /// is either a package or a single type FQN:
 ///   --buffa_opt=extern_path=.my.common=::common_protos
 ///   --buffa_opt=extern_path=.my.common.Shared=::shared_types::Shared
+///
+/// File extern paths map one `.proto` file to the Rust module of its package:
+///   --buffa_opt=file_extern_path=my/common/money.proto=::money_protos::my::common
 fn parse_config(params: &str) -> Result<PluginConfig, String> {
     let mut codegen = CodeGenConfig::default();
     let mut unbox_oneof = false;
@@ -396,6 +399,23 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
                              (or a type FQN, 'extern_path=.proto.pkg.Type=::rust::path::Type')",
                         value
                     ));
+                }
+            }
+            "file_extern_path" => {
+                // value is "<proto_file>=<rust_module>"
+                // Split on the last `=`: a file path may contain one, a Rust path can't.
+                match value.rsplit_once('=').map(|(f, r)| (f.trim(), r.trim())) {
+                    Some((file, rust)) if !file.is_empty() && !rust.is_empty() => {
+                        codegen
+                            .file_extern_paths
+                            .push((file.to_string(), rust.to_string()));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "invalid file_extern_path format '{value}', \
+                             expected 'file_extern_path=path/to/file.proto=::rust::module'"
+                        ));
+                    }
                 }
             }
             "mod_file" => {
@@ -930,6 +950,33 @@ mod tests {
         let err = parse_err("reflect_mode=fast");
         assert!(err.contains("reflect_mode"));
         assert!(err.contains("off, bridge, or vtable"));
+    }
+
+    #[test]
+    fn file_extern_paths_are_repeatable() {
+        let config = parse_config(
+            "file_extern_path=my/a.proto=::crate_a::my,file_extern_path=b.proto=::crate_b",
+        )
+        .unwrap();
+        assert_eq!(
+            config.codegen.file_extern_paths,
+            vec![
+                ("my/a.proto".to_string(), "::crate_a::my".to_string()),
+                ("b.proto".to_string(), "::crate_b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_file_extern_path_errors() {
+        for bad in [
+            "file_extern_path=no_equals_sign",
+            "file_extern_path=my/a.proto=",
+            "file_extern_path==::crate_a",
+        ] {
+            let err = parse_err(bad);
+            assert!(err.contains("file_extern_path"), "{bad}: {err}");
+        }
     }
 
     #[test]
