@@ -1,0 +1,4 @@
+kind: Added
+body: |-
+    **`CodeGenConfig::file_extern_paths`** maps every type in one `.proto` file to the Rust module of its package in another crate, for a package split across crates or a file with no `package`, which a package-keyed `extern_path` can't express. Exposed as `buffa_build::Config::file_extern_path` and the `file_extern_path=` option of `protoc-gen-buffa`. A file mapping outranks a package `extern_path` and yields to a per-type one.
+time: 2026-09-29T21:30:00+00:00

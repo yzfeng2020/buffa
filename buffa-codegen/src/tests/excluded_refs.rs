@@ -173,6 +173,24 @@ fn test_no_warn_with_package_extern_path() {
 }
 
 #[test]
+fn test_no_warn_with_file_extern_path() {
+    let (dep, kept) = fixture();
+    let config = CodeGenConfig {
+        file_extern_paths: vec![("dep.proto".to_string(), "::dep_crate::dep".to_string())],
+        ..Default::default()
+    };
+    let (_, warnings) =
+        generate_with_diagnostics(&[dep, kept], &["kept.proto".to_string()], &config).unwrap();
+
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| matches!(w, CodeGenWarning::ExcludedPackageFieldRef { .. })),
+        "must not warn when the referenced file has a file_extern_path: {warnings:?}"
+    );
+}
+
+#[test]
 fn test_no_warn_with_per_type_extern_path() {
     // A per-type extern_path (exact FQN) also suppresses the warning, not
     // just package-level ones.

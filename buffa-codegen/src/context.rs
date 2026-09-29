@@ -225,17 +225,23 @@ impl<'a> CodeGenContext<'a> {
     /// auto-injected defaults (e.g., the WKT mapping). These are computed by
     /// `crate::effective_extern_paths` before calling this constructor.
     ///
-    /// File-level extern resolution (currently only `descriptor.proto` /
-    /// `compiler/plugin.proto` → `buffa-descriptor`) is **not** applied by
-    /// this constructor — use [`for_generate`](Self::for_generate), which
-    /// computes and passes the file-level mappings, when generating code
-    /// that may reference descriptor types.
+    /// User [`CodeGenConfig::file_extern_paths`] are applied as given. The
+    /// auto-injected file-level routing (`descriptor.proto` /
+    /// `compiler/plugin.proto` → `buffa-descriptor`) is **not** — use
+    /// [`for_generate`](Self::for_generate), which computes the full
+    /// file-level mappings, when generating code that may reference
+    /// descriptor types.
     pub fn new(
         files: &'a [FileDescriptorProto],
         config: &'a CodeGenConfig,
         effective_extern_paths: &[(String, String)],
     ) -> Self {
-        Self::with_extern_resolution(files, config, effective_extern_paths, &[])
+        Self::with_extern_resolution(
+            files,
+            config,
+            effective_extern_paths,
+            &config.file_extern_paths,
+        )
     }
 
     /// Build a context with both package-level and file-level extern
@@ -256,10 +262,9 @@ impl<'a> CodeGenContext<'a> {
     /// mapping above, then a **package/prefix** `extern_path` match, then the
     /// **local** package path. See [`resolve_type_path`].
     ///
-    /// File-level mappings are an internal mechanism used for the
-    /// auto-injected descriptor-types routing. They are not part of the
-    /// public `CodeGenConfig` API; user-facing `extern_path` entries are keyed
-    /// by proto package *or* type FQN.
+    /// File-level mappings come from [`CodeGenConfig::file_extern_paths`] plus
+    /// the auto-injected descriptor-types routing; see
+    /// `crate::effective_file_extern_paths`.
     pub(crate) fn with_extern_resolution(
         files: &'a [FileDescriptorProto],
         config: &'a CodeGenConfig,
@@ -273,7 +278,7 @@ impl<'a> CodeGenContext<'a> {
 
         // Reuse the corpus-wide state a caller precomputed with
         // `SharedCorpusContext::new`: it is identical for the same `files`
-        // and oneof/pointer-repr rules regardless of `effective_extern_paths`
+        // and oneof/pointer-repr rules regardless of the extern mappings
         // (the one thing that legitimately varies per call in a
         // one-crate-per-package workspace), so this is an `Arc` clone
         // instead of a fresh corpus-wide walk. `generate` has already
@@ -354,8 +359,9 @@ impl<'a> CodeGenContext<'a> {
                 format!(".{}.", package)
             };
 
-            // The file-level extern root (the internal descriptor.proto →
-            // buffa-descriptor split) and the local package module. Per-type
+            // The file-level extern root (a user `file_extern_paths` entry or the
+            // auto-injected descriptor.proto → buffa-descriptor split) and the
+            // local package module. Per-type
             // resolution (issue #111) layers exact/longest-prefix `extern_path`
             // matching on top, via `resolve_type_path`, which preserves the
             // historic priority: per-type exact → file-level → package prefix →
@@ -1372,11 +1378,12 @@ pub(crate) fn matches_proto_prefix(prefix: &str, fqn_dotted: &str) -> bool {
 /// Look up a file-level extern mapping by exact proto file path.
 ///
 /// Unlike [`resolve_extern_prefix`], this does no prefix or package
-/// arithmetic — file-level mappings are auto-injected for a known closed set
-/// of bootstrap protos (`descriptor.proto`, `compiler/plugin.proto`) whose
-/// types live in a different crate (`buffa-descriptor`) than the rest of the
+/// arithmetic — a file-level mapping comes from a user
+/// [`CodeGenConfig::file_extern_paths`] entry or is auto-injected for the
+/// bootstrap protos (`descriptor.proto`, `compiler/plugin.proto`) whose types
+/// live in a different crate (`buffa-descriptor`) than the rest of the
 /// `google.protobuf` package (`buffa-types`). The mapped Rust module is the
-/// root of that file's generated module, with no further suffix.
+/// root of that file's types, with no further suffix.
 fn resolve_file_extern<'p>(
     file_name: &str,
     file_extern_paths: &'p [(String, String)],
@@ -1531,9 +1538,9 @@ fn resolve_type_path(
     // its prefix logic.
     //
     // `type_name_prefix` applies only to the local fallback: extern-mapped
-    // types are named by the external crate, and the file-level root is the
-    // internal descriptor.proto → buffa-descriptor split (also external to
-    // this codegen run).
+    // types are named by the external crate, and a file-level root (a user
+    // `file_extern_paths` entry or the descriptor.proto → buffa-descriptor
+    // split) is external to this codegen run too.
     if let Some((_, rust)) = extern_paths.iter().find(|(proto, _)| proto == fqn) {
         (rust.clone(), true)
     } else if let Some(root) = file_root {

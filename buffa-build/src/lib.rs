@@ -993,6 +993,9 @@ impl Config {
     /// not diagnosed at generation time; it surfaces as an unresolved-path
     /// error when the generated code is compiled.
     ///
+    /// To route a single `.proto` file (a package split across crates, or a
+    /// file with no `package`), see [`file_extern_path`](Self::file_extern_path).
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -1022,6 +1025,49 @@ impl Config {
         self.codegen_config
             .extern_paths
             .push((proto_path, rust_path.into()));
+        self
+    }
+
+    /// Map every type declared in one `.proto` file to an external Rust module.
+    ///
+    /// `proto_file` is the file's import path relative to its include root,
+    /// exactly as protoc reports it (e.g. `"my/common/money.proto"`, not the
+    /// on-disk `"proto/my/common/money.proto"` passed to [`files`](Self::files)).
+    /// `rust_module` is the absolute path of the module holding that file's
+    /// package in the crate that generates it (e.g.
+    /// `"::money_protos::my::common"`), or that crate's root for a file with
+    /// no `package`. Use it where a package-keyed
+    /// [`extern_path`](Self::extern_path) can't say where the types live: a
+    /// package split across files compiled into different crates, or a file
+    /// with no `package`.
+    ///
+    /// A file mapping outranks a package `extern_path` and yields to a
+    /// per-type one. It is ignored for a file listed in [`files`](Self::files).
+    /// A `proto_file` that matches no imported file raises a `cargo:warning`.
+    /// The first mapping for a file wins.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// buffa_build::Config::new()
+    ///     // `my.common` is split: money.proto lives in one crate, time.proto
+    ///     // in another.
+    ///     .file_extern_path("my/common/money.proto", "::money_protos::my::common")
+    ///     .file_extern_path("my/common/time.proto", "::time_protos::my::common")
+    ///     .files(&["proto/my_service.proto"])
+    ///     .includes(&["proto/"])
+    ///     .compile()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn file_extern_path(
+        mut self,
+        proto_file: impl Into<String>,
+        rust_module: impl Into<String>,
+    ) -> Self {
+        self.codegen_config
+            .file_extern_paths
+            .push((proto_file.into(), rust_module.into()));
         self
     }
 
